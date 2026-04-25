@@ -40,6 +40,7 @@ from torchrl.data import (
     DiscreteTensorSpec,
     MultiDiscreteTensorSpec,
     Composite,
+    UnboundedContinuousTensorSpec
 )
 from .env import AgentSpec
 from dataclasses import replace
@@ -267,6 +268,70 @@ class AttitudeController(Transform):
             target_roll=target_roll * torch.pi,
             target_pitch=target_pitch * torch.pi
         )
+        torch.nan_to_num_(cmds, 0.)
+        tensordict.set(self.action_key, cmds)
+        return tensordict
+
+
+class VelController(Transform):
+    def __init__(
+        self,
+        controller,
+        yaw_control: bool = True,
+        action_key: str = ("agents", "action"),
+    ):
+        super().__init__([], in_keys_inv=[("info", "drone_state")])
+        self.controller = controller
+        self.yaw_control = yaw_control
+        self.action_key = action_key
+    
+
+    def transform_input_spec(self, input_spec: TensorSpec) -> TensorSpec:
+        action_spec = input_spec[("full_action_spec", *self.action_key)]
+        if (self.yaw_control):
+            spec = UnboundedContinuousTensorSpec(action_spec.shape[:-1]+(4,), device=action_spec.device)
+        else:
+            spec = UnboundedContinuousTensorSpec(action_spec.shape[:-1]+(3,), device=action_spec.device)
+            
+        input_spec[("full_action_spec", *self.action_key)] = spec
+        return input_spec
+    
+    def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        # print("tensordict size: ", tensordict.shape)
+        # print("tensor dict: ", tensordict)
+        drone_state = tensordict[("info", "drone_state")][..., :13]
+        # print("drone state shape: ", drone_state.shape)
+
+        action = tensordict[self.action_key]
+        if (self.yaw_control):
+            target_vel, target_yaw = action.split([3, 1], -1)
+            target_vel = target_vel.unsqueeze(1)
+            target_yaw = target_yaw.unsqueeze(1)
+            # print("target vel: ", target_vel)
+            # print("target yaw: ", target_yaw)
+
+            quat = tensordict[("info", "drone_state")][..., 3:7]
+            current_yaw = quaternion_to_euler(quat)[..., 2].unsqueeze(-1).unsqueeze(1)
+            # print("current_yaw: ", current_yaw)
+
+            target_yaw = current_yaw + target_yaw
+            # print("target yaw: ", target_yaw)
+
+        else:
+            target_vel = action.unsqueeze(1)
+            # print("target vel: ", target_vel)
+            # target_yaw = torch.zeros(action.shape[:-1] + (1,), device=action.device)
+            target_yaw = None
+
+        # print("drone vel shape: ", target_vel.shape)
+        # print("target vel: ", target_vel)
+        # 设置目标速度为action输出的值，目标yaw为action输出的值（如果启用yaw control），然后调用控制器计算出对应的电机命令
+        cmds = self.controller(
+            drone_state, 
+            target_vel=target_vel, 
+            target_yaw=target_yaw
+        )
+
         torch.nan_to_num_(cmds, 0.)
         tensordict.set(self.action_key, cmds)
         return tensordict

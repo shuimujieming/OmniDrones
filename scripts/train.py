@@ -1,232 +1,140 @@
-import logging
+import argparse
 import os
-import time
-
 import hydra
-import torch
-import numpy as np
-import pandas as pd
+import datetime
 import wandb
-import matplotlib.pyplot as plt
-
-from torch.func import vmap
-from tqdm import tqdm
-from omegaconf import OmegaConf
-
-from omni_drones import init_simulation_app
-from torchrl.data import CompositeSpec
-from torchrl.envs.utils import set_exploration_type, ExplorationType
-from omni_drones.utils.torchrl import SyncDataCollector
-from omni_drones.utils.torchrl.transforms import (
-    FromMultiDiscreteAction,
-    FromDiscreteAction,
-    ravel_composite,
-    AttitudeController,
-    RateController,
-)
-from omni_drones.utils.wandb import init_wandb
-from omni_drones.utils.torchrl import RenderCallback, EpisodeStats
-from omni_drones.learning import ALGOS
-
-from setproctitle import setproctitle
-from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
+import torch
+from omegaconf import DictConfig, OmegaConf
+from ppo import PPO
+from omni_drones.controllers import LeePositionController
+from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
+from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
+from torchrl.envs.transforms import TransformedEnv, Compose
+from utils import evaluate
+from torchrl.envs.utils import ExplorationType
 
 
-@hydra.main(version_base=None, config_path=".", config_name="train")
+
+
+FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
+@hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
 def main(cfg):
-    OmegaConf.register_new_resolver("eval", eval)
-    OmegaConf.resolve(cfg)
-    OmegaConf.set_struct(cfg, False)
-    simulation_app = init_simulation_app(cfg)
-    run = init_wandb(cfg)
-    setproctitle(run.name)
-    print(OmegaConf.to_yaml(cfg))
+    # Simulation App
+    from isaaclab.app import AppLauncher
+    app_launcher = AppLauncher({"headless": cfg.headless, "anti_aliasing": 1})
+    simulation_app = app_launcher.app
 
-    from omni_drones.envs.isaac_env import IsaacEnv
-
-    env_class = IsaacEnv.REGISTRY[cfg.task.name]
-    base_env = env_class(cfg, headless=cfg.headless)
-
-    transforms = [InitTracker()]
-
-    # a CompositeSpec is by default processed by a entity-based encoder
-    # ravel it to use a MLP encoder instead
-    if cfg.task.get("ravel_obs", False):
-        transform = ravel_composite(base_env.observation_spec, ("agents", "observation"))
-        transforms.append(transform)
-    if cfg.task.get("ravel_obs_central", False):
-        transform = ravel_composite(base_env.observation_spec, ("agents", "observation_central"))
-        transforms.append(transform)
-
-    # optionally discretize the action space or use a controller
-    action_transform: str = cfg.task.get("action_transform", None)
-    if action_transform is not None:
-        if action_transform.startswith("multidiscrete"):
-            nbins = int(action_transform.split(":")[1])
-            transform = FromMultiDiscreteAction(nbins=nbins)
-            transforms.append(transform)
-        elif action_transform.startswith("discrete"):
-            nbins = int(action_transform.split(":")[1])
-            transform = FromDiscreteAction(nbins=nbins)
-            transforms.append(transform)
-        else:
-            raise NotImplementedError(f"Unknown action transform: {action_transform}")
-
-    env = TransformedEnv(base_env, Compose(*transforms)).train()
-    env.set_seed(cfg.seed)
-
-    try:
-        policy = ALGOS[cfg.algo.name.lower()](
-            cfg.algo,
-            env.observation_spec,
-            env.action_spec,
-            env.reward_spec,
-            device=base_env.device
+    # Use Wandb to monitor training
+    if (cfg.wandb.run_id is None):
+        run = wandb.init(
+            project=cfg.wandb.project,
+            name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
+            entity=cfg.wandb.entity,
+            config=cfg,
+            mode=cfg.wandb.mode,
+            id=wandb.util.generate_id(),
         )
-    except KeyError:
-        raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
+    else:
+        run = wandb.init(
+            project=cfg.wandb.project,
+            name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
+            entity=cfg.wandb.entity,
+            config=cfg,
+            mode=cfg.wandb.mode,
+            id=cfg.wandb.run_id,
+            resume="must"
+        )
 
-    frames_per_batch = env.num_envs * int(cfg.algo.train_every)
-    total_frames = cfg.get("total_frames", -1) // frames_per_batch * frames_per_batch
-    max_iters = cfg.get("max_iters", -1)
-    eval_interval = cfg.get("eval_interval", -1)
-    save_interval = cfg.get("save_interval", -1)
+    # Navigation Training Environment
+    from env import NavigationEnv
+    env = NavigationEnv(cfg)
 
-    stats_keys = [
-        k for k in base_env.observation_spec.keys(True, True)
+    # Transformed Environment
+    transforms = []
+    # transforms.append(ravel_composite(env.observation_spec, ("agents", "intrinsics"), start_dim=-1))
+    controller = LeePositionController(9.81, env.drone.params).to(cfg.device)
+    vel_transform = VelController(controller, yaw_control=True)
+    transforms.append(vel_transform)
+    transformed_env = TransformedEnv(env, Compose(*transforms)).train()
+    transformed_env.set_seed(cfg.seed)    
+    # PPO Policy
+    policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
+
+    # checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_2500.pt"
+    # checkpoint = "/home/shuimujieming/NavRL/isaac-training/wandb/run-20260424_013755-xtk1p31t/files/checkpoint_36000.pt"
+    # policy.load_state_dict(torch.load(checkpoint))
+    
+    # Episode Stats Collector
+    episode_stats_keys = [
+        k for k in transformed_env.observation_spec.keys(True, True) 
         if isinstance(k, tuple) and k[0]=="stats"
     ]
-    episode_stats = EpisodeStats(stats_keys)
+    episode_stats = EpisodeStats(episode_stats_keys)
+
+    # RL Data Collector
     collector = SyncDataCollector(
-        env,
-        policy=policy,
-        frames_per_batch=frames_per_batch,
-        total_frames=total_frames,
-        device=cfg.sim.device,
-        return_same_td=True,
+        transformed_env,
+        policy=policy, 
+        frames_per_batch=cfg.env.num_envs * cfg.algo.training_frame_num, 
+        total_frames=cfg.max_frame_num,
+        device=cfg.device,
+        return_same_td=True, # update the return tensordict inplace (should set to false if we need to use replace buffer)
+        exploration_type=ExplorationType.RANDOM, # sample from normal distribution
     )
 
-    @torch.no_grad()
-    def evaluate(
-        seed: int=0,
-        exploration_type: ExplorationType=ExplorationType.MODE
-    ):
-
-        base_env.enable_render(True)
-        base_env.eval()
-        env.eval()
-        env.set_seed(seed)
-
-        render_callback = RenderCallback(interval=2)
-
-        with set_exploration_type(exploration_type):
-            trajs = env.rollout(
-                max_steps=base_env.max_episode_length,
-                policy=policy,
-                callback=render_callback,
-                auto_reset=True,
-                break_when_any_done=False,
-                return_contiguous=False,
-            )
-        base_env.enable_render(not cfg.headless)
-        env.reset()
-
-        done = trajs.get(("next", "done"))
-        first_done = torch.argmax(done.long(), dim=1).cpu()
-
-        def take_first_episode(tensor: torch.Tensor):
-            indices = first_done.reshape(first_done.shape+(1,)*(tensor.ndim-2))
-            return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
-
-        traj_stats = {
-            k: take_first_episode(v)
-            for k, v in trajs[("next", "stats")].cpu().items()
-        }
-
-        info = {
-            "eval/stats." + k: torch.mean(v.float()).item()
-            for k, v in traj_stats.items()
-        }
-
-        # log video
-        info["recording"] = wandb.Video(
-            render_callback.get_video_array(axes="t c h w"),
-            fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
-            format="mp4"
-        )
-
-        # log distributions
-        # df = pd.DataFrame(traj_stats)
-        # table = wandb.Table(dataframe=df)
-        # info["eval/return"] = wandb.plot.histogram(table, "return")
-        # info["eval/episode_len"] = wandb.plot.histogram(table, "episode_len")
-
-        return info
-
-    pbar = tqdm(collector, total=total_frames//frames_per_batch)
-    env.train()
-    for i, data in enumerate(pbar):
+    # Training Loop
+    for i, data in enumerate(collector):
+        # print("data: ", data)
+        # print("============================")
+        # Log Info
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
-        episode_stats.add(data.to_tensordict())
 
-        if len(episode_stats) >= base_env.num_envs:
+        # Train Policy
+        train_loss_stats = policy.train(data)
+        info.update(train_loss_stats) # log training loss info
+
+        # Calculate and log training episode stats
+        episode_stats.add(data)
+        if len(episode_stats) >= transformed_env.num_envs: # evaluate once if all agents finished one episode
             stats = {
-                "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item()
+                "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item() 
                 for k, v in episode_stats.pop().items(True, True)
             }
             info.update(stats)
 
-        info.update(policy.train_op(data.to_tensordict()))
-
-        if eval_interval > 0 and i % eval_interval == 0:
-            logging.info(f"Eval at {collector._frames} steps.")
-            info.update(evaluate())
+        # Evaluate policy and log info
+        if i % cfg.eval_interval == 0:
+            print("[NavRL]: start evaluating policy at training step: ", i)
+            env.enable_render(True)
+            env.eval()
+            eval_info = evaluate(
+                env=transformed_env, 
+                policy=policy,
+                seed=cfg.seed, 
+                cfg=cfg,
+                exploration_type=ExplorationType.MEAN
+            )
+            env.enable_render(not cfg.headless)
             env.train()
-            base_env.train()
-
-        if save_interval > 0 and i % save_interval == 0:
-            try:
-                ckpt_path = os.path.join(run.dir, f"checkpoint_{collector._frames}.pt")
-                torch.save(policy.state_dict(), ckpt_path)
-                logging.info(f"Saved checkpoint to {str(ckpt_path)}")
-            except AttributeError:
-                logging.warning(f"Policy {policy} does not implement `.state_dict()`")
-
+            env.reset()
+            info.update(eval_info)
+            print("\n[NavRL]: evaluation done.")
+        
+        # Update wand info
         run.log(info)
-        print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
 
-        pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
 
-        if max_iters > 0 and i >= max_iters - 1:
-            break
+        # Save Model
+        if i % cfg.save_interval == 0:
+            ckpt_path = os.path.join(run.dir, f"checkpoint_{i}.pt")
+            torch.save(policy.state_dict(), ckpt_path)
+            print("[NavRL]: model saved at training step: ", i)
 
-    logging.info(f"Final Eval at {collector._frames} steps.")
-    info = {"env_frames": collector._frames}
-    info.update(evaluate())
-    run.log(info)
-
-    try:
-        ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
-        torch.save(policy.state_dict(), ckpt_path)
-
-        model_artifact = wandb.Artifact(
-            f"{cfg.task.name}-{cfg.algo.name.lower()}",
-            type="model",
-            description=f"{cfg.task.name}-{cfg.algo.name.lower()}",
-            metadata=dict(cfg))
-
-        model_artifact.add_file(ckpt_path)
-        wandb.save(ckpt_path)
-        run.log_artifact(model_artifact)
-
-        logging.info(f"Saved checkpoint to {str(ckpt_path)}")
-    except AttributeError:
-        logging.warning(f"Policy {policy} does not implement `.state_dict()`")
-
+    ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
+    torch.save(policy.state_dict(), ckpt_path)
     wandb.finish()
-
     simulation_app.close()
-
 
 if __name__ == "__main__":
     main()
+    
