@@ -45,6 +45,7 @@ from torchrl.data import (
 from .env import AgentSpec
 from dataclasses import replace
 
+from omni_drones.utils.torch import euler_to_quaternion, quat_axis,quaternion_to_euler
 
 def _transform_agent_spec(self: Transform, agent_spec: AgentSpec) -> AgentSpec:
     return agent_spec
@@ -305,20 +306,18 @@ class VelController(Transform):
         action = tensordict[self.action_key]
         if (self.yaw_control):
             target_vel, target_yaw = action.split([3, 1], -1)
-            target_vel = target_vel.unsqueeze(1)
-            target_yaw = target_yaw.unsqueeze(1)
             # print("target vel: ", target_vel)
             # print("target yaw: ", target_yaw)
 
             quat = tensordict[("info", "drone_state")][..., 3:7]
-            current_yaw = quaternion_to_euler(quat)[..., 2].unsqueeze(-1).unsqueeze(1)
+            current_yaw = quaternion_to_euler(quat)[..., 2].unsqueeze(-1)
             # print("current_yaw: ", current_yaw)
 
             target_yaw = current_yaw + target_yaw
             # print("target yaw: ", target_yaw)
 
         else:
-            target_vel = action.unsqueeze(1)
+            target_vel = action
             # print("target vel: ", target_vel)
             # target_yaw = torch.zeros(action.shape[:-1] + (1,), device=action.device)
             target_yaw = None
@@ -326,7 +325,7 @@ class VelController(Transform):
         # print("drone vel shape: ", target_vel.shape)
         # print("target vel: ", target_vel)
         # 设置目标速度为action输出的值，目标yaw为action输出的值（如果启用yaw control），然后调用控制器计算出对应的电机命令
-        cmds = self.controller(
+        cmds = self.controller.compute(
             drone_state, 
             target_vel=target_vel, 
             target_yaw=target_yaw
@@ -398,4 +397,3 @@ class History(Transform):
                 item_history = tensordict.get(out_key)
                 item_history[_reset] = 0.
         return tensordict
-

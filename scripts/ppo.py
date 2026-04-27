@@ -35,7 +35,7 @@ class PPO(TensorDictModuleBase):
         ).to(self.device)
 
         # Actor etwork
-        self.n_agents, self.action_dim = action_spec.shape
+        self.n_agents, self.action_dim = action_spec[("agents", "action")].shape[-2:]
         print("action dim: ", self.action_dim)
         self.action_dim = 3 # only control x, z velocity and yaw rate
         self.actor = ProbabilisticActor(
@@ -43,7 +43,8 @@ class PPO(TensorDictModuleBase):
             in_keys=["alpha", "beta"],
             out_keys=[("agents", "action_normalized")], 
             distribution_class=IndependentBeta,
-            return_log_prob=True
+            return_log_prob=True,
+            log_prob_key="sample_log_prob"
         ).to(self.device)
 
         # Critic network

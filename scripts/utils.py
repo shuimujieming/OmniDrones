@@ -170,7 +170,9 @@ def evaluate(
     env.eval()
     env.set_seed(seed)
 
-    render_callback = RenderCallback(interval=2)
+    render_callback = None
+    if cfg.get("video", False) or getattr(cfg.sim, "enable_replicator", False):
+        render_callback = RenderCallback(interval=2)
     
     with set_exploration_type(exploration_type):
         trajs = env.rollout(
@@ -202,12 +204,13 @@ def evaluate(
         for k, v in traj_stats.items()
     }
 
-    # log video
-    info["recording"] = wandb.Video(
-        render_callback.get_video_array(axes="t c h w"), 
-        fps=0.5 / (cfg.sim.dt * cfg.sim.substeps), 
-        format="mp4"
-    )
+    # log video when rendering is available
+    if render_callback is not None:
+        info["recording"] = wandb.Video(
+            render_callback.get_video_array(axes="t c h w"),
+            fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
+            format="mp4"
+        )
     env.train()
     # env.reset()
 
@@ -262,4 +265,3 @@ def construct_input(start, end):
     for n in range(start, end):
         input.append(f"{n}")
     return "(" + "|".join(input) + ")"
-

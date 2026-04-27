@@ -1,6 +1,7 @@
 import torch
 import einops
 import numpy as np
+from dataclasses import fields
 from tensordict.tensordict import TensorDict, TensorDictBase
 from torchrl.data import UnboundedContinuousTensorSpec, CompositeSpec, DiscreteTensorSpec
 from omni_drones.envs.isaac_env import IsaacEnv, AgentSpec
@@ -85,7 +86,10 @@ class NavigationEnv(IsaacEnv):
     def _design_scene(self):
         # Initialize a drone in prim /World/envs/envs_0
         drone_model = MultirotorBase.REGISTRY[self.cfg.drone.model_name] # drone model class
-        cfg = drone_model.cfg_cls(force_sensor=False)
+        cfg_kwargs = {}
+        if "force_sensor" in {field.name for field in fields(drone_model.cfg_cls)}:
+            cfg_kwargs["force_sensor"] = False
+        cfg = drone_model.cfg_cls(**cfg_kwargs)
         self.drone = drone_model(cfg=cfg)
         # drone_prim = self.drone.spawn(translations=[(0.0, 0.0, 1.0)])[0]
         drone_prim = self.drone.spawn(translations=[(0.0, 0.0, 2.0)])[0]
@@ -130,10 +134,9 @@ class NavigationEnv(IsaacEnv):
                         vertical_scale=0.1,
                         border_width=0.0,
                         num_obstacles=self.cfg.env.num_obstacles,
-                        obstacle_height_mode="range",
+                        obstacle_height_mode="choice",
                         obstacle_width_range=(0.4, 1.1),
-                        obstacle_height_range=[1.0, 1.5, 2.0, 4.0, 6.0],
-                        obstacle_height_probability=[0.1, 0.15, 0.20, 0.55],
+                        obstacle_height_range=(6.0, 8.0),
                         platform_width=0.0,
                     ),
                 },

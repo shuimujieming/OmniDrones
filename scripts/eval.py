@@ -17,7 +17,7 @@ from torchrl.envs.utils import ExplorationType
 
 def get_latest_checkpoint():
     """自动查找最新的checkpoint文件"""
-    wandb_dir = "/home/shuimujieming/NavRL/isaac-training/wandb"
+    wandb_dir = "/home/shuimujieming/OmniDrones/wandb"
     
     # 查找所有run目录，按修改时间排序
     run_dirs = glob.glob(os.path.join(wandb_dir, "run-*"))
