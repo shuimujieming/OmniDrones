@@ -170,9 +170,9 @@ def evaluate(
     env.eval()
     env.set_seed(seed)
 
-    render_callback = None
-    if cfg.get("video", False) or getattr(cfg.sim, "enable_replicator", False):
-        render_callback = RenderCallback(interval=2)
+    # render_callback = None
+    # if cfg.get("video", False) or getattr(cfg.sim, "enable_replicator", False):
+    render_callback = RenderCallback(interval=2)
     
     with set_exploration_type(exploration_type):
         trajs = env.rollout(

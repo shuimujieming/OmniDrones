@@ -6,6 +6,7 @@ sim:
   use_flatcache: true
   use_gpu_pipeline: true
   device: "cuda:0"
+  enable_replicator: True
 
   solver_type: 1
   use_gpu: True # set to False to run on CPU

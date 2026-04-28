@@ -21,7 +21,11 @@ FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 def main(cfg):
     # Simulation App
     from isaaclab.app import AppLauncher
-    app_launcher = AppLauncher({"headless": cfg.headless, "anti_aliasing": 1})
+    app_launcher = AppLauncher({
+        "headless": cfg.headless,
+        "anti_aliasing": 1,
+        "enable_cameras": cfg.sim.enable_replicator,
+    })
     simulation_app = app_launcher.app
 
     # Use Wandb to monitor training
@@ -137,4 +141,3 @@ def main(cfg):
 
 if __name__ == "__main__":
     main()
-    

@@ -1,7 +1,7 @@
 import torch
 import einops
 import numpy as np
-from dataclasses import fields
+from dataclasses import MISSING, fields
 from tensordict.tensordict import TensorDict, TensorDictBase
 from torchrl.data import UnboundedContinuousTensorSpec, CompositeSpec, DiscreteTensorSpec
 from omni_drones.envs.isaac_env import IsaacEnv, AgentSpec
@@ -9,6 +9,9 @@ import isaaclab.sim as sim_utils
 from omni_drones.robots.drone import MultirotorBase
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.terrains import TerrainImporterCfg, TerrainImporter, TerrainGeneratorCfg, HfDiscreteObstaclesTerrainCfg
+from isaaclab.terrains.height_field.hf_terrains_cfg import HfTerrainBaseCfg
+from isaaclab.terrains.height_field.utils import height_field_to_mesh
+from isaaclab.utils import configclass
 from omni_drones.utils.torch import euler_to_quaternion, quat_axis,quaternion_to_euler
 from isaaclab.sensors import RayCaster, RayCasterCfg, patterns
 from isaacsim.core.utils.viewports import set_camera_view
@@ -19,6 +22,167 @@ import isaaclab.utils.math as math_utils
 from isaaclab.assets import RigidObject, RigidObjectCfg
 import time
 import torch.distributions as D
+
+
+@height_field_to_mesh
+def hf_range_obstacles_terrain(difficulty: float, cfg: "HfRangeObstaclesTerrainCfg") -> np.ndarray:
+    """Generate a terrain with randomly generated obstacles as pillars with positive and negative heights.
+
+    The terrain is a flat platform at the center of the terrain with randomly generated obstacles as pillars
+    with positive and negative height. The obstacles are randomly generated cuboids with a random width and
+    height. They are placed randomly on the terrain with a minimum distance of :obj:`cfg.platform_width`
+    from the center of the terrain.
+
+    .. image:: ../../_static/terrains/height_field/discrete_obstacles_terrain.jpg
+       :width: 40%
+       :align: center
+
+    Args:
+        difficulty: The difficulty of the terrain. This is a value between 0 and 1.
+        cfg: The configuration for the terrain.
+
+    Returns:
+        The height field of the terrain as a 2D numpy array with discretized heights.
+        The shape of the array is (width, length), where width and length are the number of points
+        along the x and y axis, respectively.
+    """
+    # resolve terrain configuration
+    obs_height = cfg.obstacle_height_range[0] + difficulty * (
+        cfg.obstacle_height_range[1] - cfg.obstacle_height_range[0]
+    )
+
+    # switch parameters to discrete units
+    # -- terrain
+    width_pixels = int(cfg.size[0] / cfg.horizontal_scale)
+    length_pixels = int(cfg.size[1] / cfg.horizontal_scale)
+    # -- obstacles
+    obs_height = int(obs_height / cfg.vertical_scale)
+    obs_width_min = int(cfg.obstacle_width_range[0] / cfg.horizontal_scale)
+    obs_width_max = int(cfg.obstacle_width_range[1] / cfg.horizontal_scale)
+    # -- center of the terrain
+    platform_width = int(cfg.platform_width / cfg.horizontal_scale)
+
+    # create discrete ranges for the obstacles
+    # -- shape
+    obs_width_range = np.arange(obs_width_min, obs_width_max, 4)
+    obs_length_range = np.arange(obs_width_min, obs_width_max, 4)
+    # -- position
+    obs_x_range = np.arange(0, width_pixels, 4)
+    obs_y_range = np.arange(0, length_pixels, 4)
+    obstacles_history = []
+
+    # create a terrain with a flat platform at the center
+    hf_raw = np.zeros((width_pixels, length_pixels))
+    # generate the obstacles
+    # print("Attention!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    # print("height range: ", cfg.obstacle_height_range)
+    probability_length = len(cfg.obstacle_height_probability)
+
+    def good_distance(x, y, width, length, obstacles_hist, bad_range = [2, 10]):
+        # lower_bound_pixels = bad_range[0] / cfg.horizontal_scale
+        # upper_bound_pixels = bad_range[1] / cfg.horizontal_scale
+
+
+        lower_bound_pixels = bad_range[0]
+        upper_bound_pixels = bad_range[1]    
+        # previous x, y, w, l. Calculate for closet points
+        for (xp, yp, wp, lp) in obstacles_hist:
+            dx = abs(xp - x) - width
+            dy = abs(yp - y) - length
+            if dx<0 and dy<0:
+                continue
+            distance = np.sqrt(dx**2 + dy**2)
+            # print("distance: ", distance)
+            # print("lower_bound_pixels: ", lower_bound_pixels)
+            # print("upper_bound_pixels: ", upper_bound_pixels)
+            # print("x: ", x)
+            # print("y: ", y)
+            if distance >= lower_bound_pixels and distance <= upper_bound_pixels:
+                return False
+        return True
+
+
+    # print("Calculation Start!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    num = 0
+    for _ in range(cfg.num_obstacles):
+        # print("Number of cylinders generated: ", num)
+        # sample size        
+        if cfg.obstacle_height_mode == "choice":
+            height = np.random.choice([-obs_height, -obs_height // 2, obs_height // 2, obs_height])
+        elif cfg.obstacle_height_mode == "fixed":
+            height = obs_height
+        elif cfg.obstacle_height_mode == "range":
+            random_roll = np.random.choice(probability_length, 1, p=cfg.obstacle_height_probability)
+            for n in range(probability_length):
+                if random_roll == n:
+                    height = np.random.uniform(cfg.obstacle_height_range[n]/cfg.vertical_scale, cfg.obstacle_height_range[n+1]/cfg.vertical_scale)
+                    break
+
+
+            # height = np.random.uniform(cfg.obstacle_height_range[0]/cfg.vertical_scale, cfg.obstacle_height_range[1]/cfg.vertical_scale)
+        else:
+            raise ValueError(f"Unknown obstacle height mode '{cfg.obstacle_height_mode}'. Must be 'choice' or 'fixed' or 'range'.")
+        
+        attempts = 0
+        # print("Start choosing location!!")
+        while attempts < 100000:
+            width = int(np.random.choice(obs_width_range))
+            length = int(np.random.choice(obs_length_range))
+            # sample position
+            x_start = int(np.random.choice(obs_x_range))
+            y_start = int(np.random.choice(obs_y_range))
+            if x_start + width > width_pixels:
+                x_start = width_pixels - width
+            if y_start + length > length_pixels:
+                y_start = length_pixels - length
+            
+            if good_distance(x_start, y_start, width, length, obstacles_history):
+                break
+            elif obstacles_history == []:
+                break
+            # print("attempts when generated: ", attempts)
+            # print("obstacles_history: ", obstacles_history)
+            attempts += 1
+        # print("attempts when generated: ", attempts)
+        obstacles_history.append((x_start, y_start, width, length))
+        num += 1
+        # clip start position to the terrain
+        # print("x_start: ", x_start)
+        # print("y_start: ", y_start)
+        # add to terrain
+        hf_raw[x_start : x_start + width, y_start : y_start + length] = height
+    # print("Calculation End!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")    
+    # clip the terrain to the platform
+    x1 = (width_pixels - platform_width) // 2
+    x2 = (width_pixels + platform_width) // 2
+    y1 = (length_pixels - platform_width) // 2
+    y2 = (length_pixels + platform_width) // 2
+    hf_raw[x1:x2, y1:y2] = 0
+    # round off the heights to the nearest vertical step
+    return np.rint(hf_raw).astype(np.int16)
+
+
+@configclass
+class HfRangeObstaclesTerrainCfg(HfTerrainBaseCfg):
+    """Configuration for a discrete obstacles height field terrain."""
+
+    function = hf_range_obstacles_terrain
+
+    obstacle_height_mode: str = "choice"
+    """The mode to use for the obstacle height. Defaults to "choice".
+
+    The following modes are supported: "choice", "fixed".
+    """
+    obstacle_width_range: tuple[float, float] = MISSING
+    """The minimum and maximum width of the obstacles (in m)."""
+    # obstacle_height_range: tuple[float, float] = MISSING
+    obstacle_height_range: list = MISSING
+    """The minimum and maximum height of the obstacles (in m)."""
+    obstacle_height_probability: list = MISSING
+    num_obstacles: int = MISSING
+    """The number of obstacles to generate."""
+    platform_width: float = 1.0
+    """The width of the square platform at the center of the terrain. Defaults to 1.0."""
 
 class NavigationEnv(IsaacEnv):
 
@@ -48,8 +212,7 @@ class NavigationEnv(IsaacEnv):
         ray_caster_cfg = RayCasterCfg(
             prim_path="/World/envs/env_.*/Hummingbird_0/base_link",
             offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
-            attach_yaw_only=True,
-            # attach_yaw_only=False,
+            ray_alignment="yaw",
             pattern_cfg=patterns.BpearlPatternCfg(
                 horizontal_res=self.lidar_hres, # horizontal default is set to 10
                 vertical_ray_angles=torch.linspace(*self.lidar_vfov, self.lidar_vbeams) 
@@ -129,14 +292,15 @@ class NavigationEnv(IsaacEnv):
                 use_cache=False,
                 color_scheme="height",
                 sub_terrains={
-                    "obstacles": HfDiscreteObstaclesTerrainCfg(
+                    "obstacles": HfRangeObstaclesTerrainCfg(
                         horizontal_scale=0.1,
                         vertical_scale=0.1,
                         border_width=0.0,
                         num_obstacles=self.cfg.env.num_obstacles,
-                        obstacle_height_mode="choice",
+                        obstacle_height_mode="range",
                         obstacle_width_range=(0.4, 1.1),
-                        obstacle_height_range=(6.0, 8.0),
+                        obstacle_height_range=[1.0, 1.5, 2.0, 4.0, 6.0],
+                        obstacle_height_probability=[0.1, 0.15, 0.20, 0.55],
                         platform_width=0.0,
                     ),
                 },

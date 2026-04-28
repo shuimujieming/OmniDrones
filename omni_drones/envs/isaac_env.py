@@ -173,11 +173,11 @@ class IsaacEnv(EnvBase):
         # find the environment closest to the origin for visualization
         self.central_env_idx = self.envs_positions.norm(dim=-1).argmin()
         central_env_pos = self.envs_positions[self.central_env_idx].cpu().numpy()
-        if self.enable_viewport:
-            set_camera_view(
-                eye=central_env_pos + np.asarray(self.cfg.viewer.eye),
-                target=central_env_pos + np.asarray(self.cfg.viewer.lookat)
-            )
+        # if self.enable_viewport:
+        #     set_camera_view(
+        #         eye=central_env_pos + np.asarray(self.cfg.viewer.eye),
+        #         target=central_env_pos + np.asarray(self.cfg.viewer.lookat)
+        #     )
 
         RobotBase._envs_positions = self.envs_positions.unsqueeze(1)
 
@@ -467,8 +467,8 @@ class IsaacEnv(EnvBase):
     def _create_viewport_render_product(self):
         """Create a render product of the viewport for rendering."""
         # set camera view for "/OmniverseKit_Persp" camera
-        if self.enable_viewport:
-            set_camera_view(eye=self.cfg.viewer.eye, target=self.cfg.viewer.lookat)
+        # if self.enable_viewport:
+        set_camera_view(eye=self.cfg.viewer.eye, target=self.cfg.viewer.lookat)
 
         # check if flatcache is enabled
         # this is needed to flush the flatcache data into Hydra manually when calling `env.render()`
